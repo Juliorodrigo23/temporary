@@ -1,0 +1,1642 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>2D Physics Robot Arm – Macro‑State Logging with Axis‑Based Events</title>
+  <style>
+    body {
+      margin-top: 0vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+    }
+    canvas {
+      display: block;
+      background-color: #f0f0f0;
+    }
+    .arcade-container {
+      position: absolute;
+    }
+
+    .arcade-overlay {
+      position: absolute;
+      top: -240px;
+      left: -200px;
+      width: 320%;
+      height: 320%;
+      background-image: url('arcade_cabinet.png');
+      background-size: contain;
+      background-repeat: no-repeat;
+      pointer-events: none; /* Allows clicking through to simulation */
+      z-index: 5;
+    }
+  
+    #controls {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 10;
+      display: flex;
+      flex-direction: column; /* Align buttons vertically */
+    }
+    #controls button {
+      margin-bottom: 10px; /* Space between buttons */
+      padding: 10px 20px;
+      border: none;
+      border-radius: 20px; /* Oval shape */
+      font-size: 16px;
+      cursor: pointer;
+      background: linear-gradient(to top, #90EE90, #ffb52c); /* Green to orange gradient */
+      color: black;
+      outline: 2px solid black;
+    }
+  </style>
+</head>
+<body>
+  <div id="controls">
+    <button id="randomModeButton">Random Movement</button>
+    <button id="mouseModeButton">Mouse Control</button>
+    <button id="downloadCSVButton">Download CSV Log</button>
+  </div>
+  <div class="arcade-container">
+  <canvas id="physicsCanvas"></canvas>
+  <div class="arcade-overlay"></div>
+  </div>
+  <CausalDAG />
+
+  <!-- Matter.js is loaded from CDN -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.js"></script>
+  <script>
+    //////////////////////////////
+    // DataLogger: Collects events and exports a CSV.
+    // Each event now includes a "parent_event_id" field.
+    class DataLogger {
+  constructor() {
+    this.events = [];
+    this.lastId = 0;
+  }
+  
+  logEvent(event) {
+    // Create a simplified event while preserving crucial fields for the DAG
+    const simplifiedEvent = {
+      id: this.lastId++,
+      timestamp: new Date().toISOString(),
+      // Keep the original event type for visualization
+      eventType: event.eventType,
+      // Our primary tracking variables
+      handX: event.handX !== undefined ? event.handX : null,
+      handY: event.handY !== undefined ? event.handY : null,
+      // Maintain collision as collision (not collisionEvent) for compatibility
+      collision: event.collision || false,
+      ballX: event.ballX !== undefined ? event.ballX : null,
+      ballY: event.ballY !== undefined ? event.ballY : null,
+      // Keep parent_event_id for causal chains
+      parent_event_id: event.parent_event_id
+    };
+    
+    this.events.push(simplifiedEvent);
+    return simplifiedEvent;
+  }
+  
+  toCSV() {
+    const headers = [
+      "id",
+      "timestamp",
+      "eventType",
+      "handX",
+      "handY",
+      "collision", 
+      "ballX",
+      "ballY",
+      "parent_event_id"
+    ];
+    
+    const rows = this.events.map(event => {
+      return [
+        event.id,
+        event.timestamp,
+        event.eventType || "",
+        event.handX !== null ? event.handX.toFixed(2) : "",
+        event.handY !== null ? event.handY.toFixed(2) : "",
+        event.collision ? "true" : "false",
+        event.ballX !== null ? event.ballX.toFixed(2) : "",
+        event.ballY !== null ? event.ballY.toFixed(2) : "",
+        event.parent_event_id || ""
+      ].join(",");
+    });
+    
+    return [headers.join(","), ...rows].join("\n");
+  }
+
+  downloadCSV() {
+    const csvContent = this.toCSV();
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "robot_arm_dag_log.csv";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+}
+
+
+    //////////////////////////////
+    // RobotArm: The simulation.
+    // This version logs a macro state only when key state aspects change.
+    // It creates events with eventType:
+    // - "arm_movement_x" or "arm_movement_y" if no collision,
+    // - "ball_movement_x" or "ball_movement_y" if a collision occurs.
+    // The parent_event_id links the causal chain.
+    class RobotArm {
+      constructor(canvas) {
+        this.canvas = canvas;
+        this.interventionActive = false;
+        this.context = canvas.getContext("2d");
+        this.engine = Matter.Engine.create({
+          enableSleeping: false,
+          constraintIterations: 8,  // Reduced from 10
+          positionIterations: 12,   // Increased for stability at small scale
+          velocityIterations: 8     // Added for smoother movement
+        });
+        this.dataLogger = new DataLogger();
+        setInterval(() => {
+          this.sendEventsToServer();
+        }, 3000);
+        this.pollInterventions();
+        this.reset();
+      }
+      reset() {
+        Matter.World.clear(this.engine.world);
+        this.physicsWorld = this.engine.world;
+        this.setupPhysicsWorld();
+        this.isRunning = false;
+        this.controlMode = "random"; // "random" or "mouse"
+        this.mousePosition = { x: 0, y: 0 };
+        this.isBallHeld = false;
+        this.pickupConstraint = null;
+        this.lastRandomMove = 0;
+        this.randomMoveInterval = 2000;
+        this.targetPosition = null;
+        // Macro logging interval (e.g. 500ms).
+        this.lastMacroLogTime = 0;
+        this.macroInterval = 500;
+        // Collision flag for the current interval.
+        this.collisionOccurred = false;
+        this.collisionAxis = "none";
+        // Track the last logged macro event to chain causal links.
+        this.lastLoggedEvent = null;
+      }
+      setupPhysicsWorld() {
+        this.canvas.width = 720/2; //720
+        this.canvas.height = 480/2; //480
+  
+        const linkWidth = 75; //150
+        const linkHeight = 6; //12
+        const handRadius = 7.5; //15
+        const armCollisionGroup = Matter.Body.nextGroup(true);
+  
+        const armLinkOptions = {
+          friction: 0.001, //0.01
+          restitution: 0.01, //0.1
+          collisionFilter: {
+            group: armCollisionGroup,
+            category: 0x0002,
+            mask: 0x0001 | 0x0004
+          },
+          chamfer: { radius: 5 }, //5
+          density: 0.01 //0.001
+        };
+  
+        this.boundaries = {
+          floor: Matter.Bodies.rectangle(this.canvas.width / 2, this.canvas.height, this.canvas.width, 50, {
+            isStatic: true,
+            friction: 0.9,
+            render: { fillStyle: "#666666" }
+          }),
+          roof: Matter.Bodies.rectangle(this.canvas.width / 2, 0, this.canvas.width, 50, {
+            isStatic: true,
+            render: { fillStyle: "#666666" }
+          }),
+          leftWall: Matter.Bodies.rectangle(0, this.canvas.height / 2, 50, this.canvas.height, {
+            isStatic: true,
+            render: { fillStyle: "#666666" }
+          }),
+          rightWall: Matter.Bodies.rectangle(this.canvas.width, this.canvas.height / 2, 50, this.canvas.height, {
+            isStatic: true,
+            render: { fillStyle: "#666666" }
+          })
+        };
+  
+        this.armParts = {
+          base: Matter.Bodies.rectangle(this.canvas.width / 2, this.canvas.height, 60, 50, {
+            isStatic: true,
+            render: { fillStyle: "#444444" } // Keeping base static
+          }),
+          link1: Matter.Bodies.rectangle(
+            this.canvas.width / 2,
+            this.canvas.height - 60,
+            linkWidth,
+            linkHeight,
+            {
+              ...armLinkOptions,
+              angle: Math.PI / 2,
+              render: {
+                sprite: {
+                  texture: "arm.png",
+                  xScale: .25, // 0.5
+                  yScale: .25, //0.5
+                  xOffset: 0
+                }
+              }
+            }
+          ),
+          link2: Matter.Bodies.rectangle(
+            this.canvas.width / 2 + linkWidth,
+            this.canvas.height - 60,
+            linkWidth,
+            linkHeight,
+            {
+              ...armLinkOptions,
+              angle: Math.PI / 2,
+              render: {
+                sprite: {
+                  texture: "arm.png",
+                  xScale: 0.25, //0.5
+                  yScale: 0.25, //0.5
+                  xOffset: 0
+                }
+              }
+            }
+          ),
+          hand: Matter.Bodies.circle(
+            this.canvas.width / 2 + 2 * linkWidth,
+            this.canvas.height - 60,
+            handRadius,
+            {
+              ...armLinkOptions,
+              angle: Math.PI / 2,
+              render: {
+                sprite: {
+                  texture: "hand_empty.png", // Default empty hand
+                  xScale: .5, //1
+                  yScale: .5 //1
+                }
+              }
+            }
+          )
+        };
+
+        // Set up joints with "joint.png"
+        this.joints = {
+          base: Matter.Constraint.create({
+            bodyA: this.armParts.base,
+            bodyB: this.armParts.link1,
+            pointA: { x: 0, y: -25 },
+            pointB: { x: -linkWidth / 2, y: 0 },
+            stiffness: 0.2, //0.1
+            length: 0,
+            damping: 0.2,
+            angle: 90,
+            render: {
+              sprite: {
+                texture: "joint.png",
+                xScale: 0.25, //.5
+                yScale: 0.25 //.5
+              }
+            }
+          }),
+          elbow: Matter.Constraint.create({
+            bodyA: this.armParts.link1,
+            bodyB: this.armParts.link2,
+            pointA: { x: linkWidth / 2, y: 0 },
+            pointB: { x: -linkWidth / 2, y: 0 },
+            stiffness: 0.2, //0.1
+            length: 0,
+            damping: 0.3,
+            angle: 90,
+            render: {
+              sprite: {
+                texture: "joint.png",
+                xScale: 0.25, //.5
+                yScale: 0.25 //.5
+              }
+            }
+          }),
+          wrist: Matter.Constraint.create({
+            bodyA: this.armParts.link2,
+            bodyB: this.armParts.hand,
+            pointA: { x: linkWidth / 2, y: 0 },
+            pointB: { x: -handRadius, y: 0 },
+            stiffness: 0.2, //0.1
+            length: 0,
+            damping: 0.3, //0.3
+            angle: 90,
+            render: {
+              sprite: {
+                texture: "joint.png",
+                xScale: 0.25, //.5
+                yScale: 0.25 //.5
+              }
+            }
+          })
+        };
+
+        // Replace ball with "ball.png"
+        this.redBall = Matter.Bodies.circle(100, 100, 15, {
+          friction: 0.01,
+          frictionAir: 0.0005,
+          restitution: 0.9,
+          density: 0.0008,
+          angle: 90,
+          render: {
+            sprite: {
+              texture: "ball.png",
+              xScale: .75, //2
+              yScale: .75 //2
+            }
+          },
+          collisionFilter: {
+            group: 0,
+            category: 0x0004,
+            mask: 0x0001 | 0x0002
+          }
+        });
+
+  
+        Matter.World.add(this.physicsWorld, [
+          ...Object.values(this.boundaries),
+          ...Object.values(this.armParts),
+          ...Object.values(this.joints),
+          this.redBall
+        ]);
+  
+        // Collision listener: simply flag a collision for the current macro interval.
+        Matter.Events.on(this.engine, "collisionStart", (event) => {
+  event.pairs.forEach(pair => {
+    // Skip if ball is already held
+    if (this.isBallHeld) return;
+    
+    // Check for ball collision with any object
+    const isBallInvolved = pair.bodyA === this.redBall || pair.bodyB === this.redBall;
+    
+    if (!isBallInvolved) return;
+    
+    // Get the other body (not the ball)
+    const otherBody = pair.bodyA === this.redBall ? pair.bodyB : pair.bodyA;
+    
+    // Get ball velocity components
+    let ballVx = this.redBall.velocity.x;
+    let ballVy = this.redBall.velocity.y;
+    
+    // Determine collision axis
+    const xSignificant = Math.abs(ballVx) > 0.5;
+    const ySignificant = Math.abs(ballVy) > 0.5;
+    
+    let collisionAxisValue;
+    if (xSignificant && ySignificant) {
+      collisionAxisValue = "both";
+    } else if (xSignificant) {
+      collisionAxisValue = "x";
+    } else if (ySignificant) {
+      collisionAxisValue = "y";
+    } else {
+      collisionAxisValue = "none";
+    }
+    
+    // Identify collision partner with priority to arm parts
+    let collisionPartner = "unknown";
+    
+    // Check for arm parts first (highest priority)
+    if (otherBody === this.armParts.hand) {
+      collisionPartner = "hand";
+    } else if (otherBody === this.armParts.link1) {
+      collisionPartner = "arm_link1";
+    } else if (otherBody === this.armParts.link2) {
+      collisionPartner = "arm_link2";
+    } 
+    // Then check static boundaries
+    else if (otherBody === this.boundaries.floor) {
+      collisionPartner = "floor";
+    } else if (otherBody === this.boundaries.roof) {
+      collisionPartner = "roof";
+    } else if (otherBody === this.boundaries.leftWall) {
+      collisionPartner = "left_wall";
+    } else if (otherBody === this.boundaries.rightWall) {
+      collisionPartner = "right_wall";
+    }
+    
+    // Store collision info for next logging cycle
+    this.collisionOccurred = true;
+    this.collisionAxis = collisionAxisValue;
+    this.collisionPartner = collisionPartner;
+    
+    // If collision is with the hand, check if we should pick up the ball
+    if (collisionPartner === "hand" && !this.isBallHeld) {
+      // Only auto-pickup in random mode and when the ball is moving slowly
+      const ballSpeed = Math.sqrt(ballVx * ballVx + ballVy * ballVy);
+      if (this.controlMode === "random" && ballSpeed < 5.0 && Math.random() < 0.5) {
+        this.pickupBall();
+      }
+    }
+  });
+});
+
+
+
+  
+        this.setupRenderer();
+      }
+      setupRenderer() {
+        this.render = Matter.Render.create({
+          canvas: this.canvas,
+          engine: this.engine,
+          options: {
+            width: this.canvas.width,
+            height: this.canvas.height,
+            wireframes: false,
+            background: "#f0f0f0"
+          }
+        });
+      }
+      generateRandomTarget() {
+        // Create a smooth transition between movement patterns
+        // Use oscillation parameters that change over time
+        if (!this.oscillationParams) {
+          this.oscillationParams = {
+            centerX: this.canvas.width / 2,
+            centerY: this.canvas.height / 2,
+            radiusX: 70 + Math.random() * 50, //70
+            radiusY: 70 + Math.random() * 50, //70
+            speedX: 0.05 + Math.random() * 0.1, //0.0005 * 0.001
+            speedY: 0.07 + Math.random() * 0.1, //0.0007 * 0.001
+            phaseX: Math.random() * Math.PI * 2,
+            phaseY: Math.random() * Math.PI * 2
+          };
+        }
+        
+        // Occasionally change the oscillation pattern completely
+        if (Math.random() < 0.05) {
+          // Preserve current center to avoid jumps
+          const centerX = this.oscillationParams.centerX;
+          const centerY = this.oscillationParams.centerY;
+          
+          // Blend to new parameters
+          this.oscillationParams = {
+            centerX: centerX * 0.8 + (Math.random() * this.canvas.width * 0.7 + this.canvas.width * 0.15) * 0.2,
+            centerY: centerY * 0.8 + (Math.random() * this.canvas.height * 0.6 + this.canvas.height * 0.2) * 0.2,
+            radiusX: 50 + Math.random() * 70,
+            radiusY: 50 + Math.random() * 70,
+            speedX: 0.0003 + Math.random() * 0.0012,
+            speedY: 0.0004 + Math.random() * 0.0012,
+            phaseX: this.oscillationParams.phaseX, // Keep phase continuous
+            phaseY: this.oscillationParams.phaseY  // Keep phase continuous
+          };
+        }
+        
+        // Gradually drift the center point
+        this.oscillationParams.centerX += (Math.random() - 0.5) * 2;
+        this.oscillationParams.centerY += (Math.random() - 0.5) * 2;
+        
+        // Keep the center within bounds
+        const padding = 100;
+        this.oscillationParams.centerX = Math.min(Math.max(padding, this.oscillationParams.centerX), this.canvas.width - padding);
+        this.oscillationParams.centerY = Math.min(Math.max(padding, this.oscillationParams.centerY), this.canvas.height - padding);
+        
+        // Update phases
+        this.oscillationParams.phaseX += this.oscillationParams.speedX * (Date.now() - (this.lastPhaseUpdate || Date.now()));
+        this.oscillationParams.phaseY += this.oscillationParams.speedY * (Date.now() - (this.lastPhaseUpdate || Date.now()));
+        this.lastPhaseUpdate = Date.now();
+        
+        // Calculate new position based on oscillation
+        const newX = this.oscillationParams.centerX + 
+                    Math.sin(this.oscillationParams.phaseX) * this.oscillationParams.radiusX;
+        const newY = this.oscillationParams.centerY + 
+                    Math.sin(this.oscillationParams.phaseY) * this.oscillationParams.radiusY;
+        
+        return { x: newX, y: newY };
+      }
+      moveTowardsTarget(target, speed = 0.15) {
+        const hand = this.armParts.hand;
+        if (!hand) return;
+        
+        // For random mode only, apply smoothing
+        if (this.controlMode === "random") {
+          // Initialize random movement smoother if needed
+          if (!this.randomMovementSmoother) {
+            this.randomMovementSmoother = {
+              x: hand.position.x,
+              y: hand.position.y,
+              vx: 0,
+              vy: 0
+            };
+          }
+          
+          // Apply smoothing to random movement
+          const smoothFactor = 0.05;
+          const dampingFactor = 0.85;
+          
+          const dx = target.x - this.randomMovementSmoother.x;
+          const dy = target.y - this.randomMovementSmoother.y;
+          
+          this.randomMovementSmoother.vx = this.randomMovementSmoother.vx * dampingFactor + dx * smoothFactor;
+          this.randomMovementSmoother.vy = this.randomMovementSmoother.vy * dampingFactor + dy * smoothFactor;
+          
+          this.randomMovementSmoother.x += this.randomMovementSmoother.vx;
+          this.randomMovementSmoother.y += this.randomMovementSmoother.vy;
+          
+          // Apply force toward the smoothed position
+          const smoothDx = this.randomMovementSmoother.x - hand.position.x;
+          const smoothDy = this.randomMovementSmoother.y - hand.position.y;
+          const distance = Math.sqrt(smoothDx * smoothDx + smoothDy * smoothDy);
+          
+          if (distance > 1) {
+            const forceMultiplier = speed * 0.01;
+            const force = {
+              x: (smoothDx / distance) * forceMultiplier,
+              y: (smoothDy / distance) * forceMultiplier
+            };
+            
+            Matter.Body.applyForce(hand, hand.position, force);
+          }
+          
+          return distance < 10;
+        } 
+        else {
+          // For mouse mode or any other mode, use the original implementation
+          // This ensures mouse control still works as before
+          const dx = target.x - hand.position.x;
+          const dy = target.y - hand.position.y;
+          const distance = Math.sqrt(dx * dx + dy * dy);
+          
+          if (distance > 5) {
+            // Reduced force for smoother movement by adjusting these parameters
+            // Lower stiffness (baseForce) and add more damping
+            const baseForce = speed * Math.exp(-distance / 150) * 0.7; // Reduced force
+            
+            // Apply smoothed force with less random jitter
+            const force = {
+              x: (dx / distance) * baseForce * (1 + Math.random() * 0.05), // Reduced randomness
+              y: (dy / distance) * baseForce * (1 + Math.random() * 0.05)  // Reduced randomness
+            };
+            
+            Matter.Body.applyForce(hand, hand.position, force);
+          }
+          
+          return distance < 15;
+        }
+      }
+
+      updateRandomMovement() {
+        const currentTime = Date.now();
+        
+        // Update target position less frequently for smoother transitions
+        if (!this.targetPosition || currentTime - this.lastRandomMove > this.randomMoveInterval) {
+          // Generate a new target based on oscillation pattern
+          const newTarget = this.generateRandomTarget();
+          
+          // If we already had a target, blend with it for smoother transition
+          if (this.targetPosition) {
+            // Higher blend factor = more of the old position (smoother transitions)
+            const blendFactor = 0.7;
+            this.targetPosition = {
+              x: this.targetPosition.x * blendFactor + newTarget.x * (1 - blendFactor),
+              y: this.targetPosition.y * blendFactor + newTarget.y * (1 - blendFactor)
+            };
+          } else {
+            this.targetPosition = newTarget;
+          }
+          
+          this.lastRandomMove = currentTime;
+        } else {
+          // Continuously update the target based on oscillation, even between major changes
+          // This creates more fluid, continuous motion
+          const oscillationUpdate = this.generateRandomTarget();
+          
+          // Subtle continuous adjustment (very small influence)
+          const microBlend = 0.03;
+          this.targetPosition = {
+            x: this.targetPosition.x * (1 - microBlend) + oscillationUpdate.x * microBlend,
+            y: this.targetPosition.y * (1 - microBlend) + oscillationUpdate.y * microBlend
+          };
+        }
+        
+        // Move towards the current target with the smooth movement system
+        this.moveTowardsTarget(this.targetPosition, 0.4);
+        
+        // Auto pickup or release logic
+        if (!this.isBallHeld) {
+          const dist = Matter.Vector.magnitude(Matter.Vector.sub(
+            this.armParts.hand.position,
+            this.redBall.position
+          ));
+          if (dist < 40 && Math.random() < 0.01) {
+            this.pickupBall();
+          }
+        } else if (Math.random() < 0.005) {
+          this.releaseBall();
+        }
+      }
+      handleMouseClick(mouseX, mouseY) {
+        if (!this.armParts.hand || !this.redBall) return;
+        const handPos = this.armParts.hand.position;
+        const ballPos = this.redBall.position;
+        const clickPos = { x: mouseX, y: mouseY };
+        const distToHand = Matter.Vector.magnitude(Matter.Vector.sub(handPos, clickPos));
+        const distToBall = Matter.Vector.magnitude(Matter.Vector.sub(ballPos, clickPos));
+        if (distToHand < 50 && distToBall < 50 && !this.isBallHeld) {
+          this.pickupBall();
+        } else if (this.isBallHeld) {
+          this.releaseBall();
+        }
+      }
+
+
+      // Discrete event: ball pickup.
+      pickupBall() {
+  if (this.isBallHeld) return;
+
+  // Hand and ball properties before pickup
+  const hand = this.armParts.hand;
+  const ball = this.redBall;
+  const handVx = hand.velocity.x;
+  const handVy = hand.velocity.y;
+  
+  // Determine hand axis
+  let handAxisValue = "none";
+  if (Math.abs(handVx) > 0.1 && Math.abs(handVy) > 0.1) {
+    handAxisValue = "both";
+  } else if (Math.abs(handVx) > 0.1) {
+    handAxisValue = "x";
+  } else if (Math.abs(handVy) > 0.1) {
+    handAxisValue = "y";
+  }
+  
+  // Ball properties
+  const ballVx = ball.velocity.x;
+  const ballVy = ball.velocity.y;
+  
+  // Determine ball axis
+  let ballAxisValue = "none";
+  if (Math.abs(ballVx) > 0.1 && Math.abs(ballVy) > 0.1) {
+    ballAxisValue = "both";
+  } else if (Math.abs(ballVx) > 0.1) {
+    ballAxisValue = "x";
+  } else if (Math.abs(ballVy) > 0.1) {
+    ballAxisValue = "y";
+  }
+  
+  // Calculate distance between hand and ball
+  const distToBall = Matter.Vector.magnitude(
+    Matter.Vector.sub(hand.position, ball.position)
+  );
+  
+  // Apply the pickup action
+  this.isBallHeld = true;
+  this.redBall.render.opacity = 0.3;
+  this.armParts.hand.render.sprite.texture = "hand_with_ball.png";
+  
+  // Create the constraint
+  this.pickupConstraint = Matter.Constraint.create({
+    bodyA: this.armParts.hand,
+    bodyB: this.redBall,
+    stiffness: 0.9,
+    length: 0
+  });
+  
+  Matter.World.add(this.physicsWorld, this.pickupConstraint);
+  
+  // Calculate the pickup velocity
+  const pickupVelocity = Math.sqrt(ballVx * ballVx + ballVy * ballVy);
+  
+  // Create the pickup event with all data as direct fields (no JSON)
+  const pickupEvent = {
+    eventType: "ball_pickup",
+    controlMode: this.controlMode,
+    // Hand data
+    handX: hand.position.x,
+    handY: hand.position.y,
+    handVx: handVx,
+    handVy: handVy,
+    handAxis: handAxisValue,
+    // Ball data
+    ballX: ball.position.x,
+    ballY: ball.position.y,
+    ballVx: ballVx,
+    ballVy: ballVy,
+    ballAxis: ballAxisValue,
+    ballHeld: true,
+    // No collision during pickup
+    collision: false,
+    collisionAxis: "none",
+    collisionPartner: "none",
+    // Distance data
+    handBallDistance: Math.round(distToBall),
+    touchingBall: true,
+    // Extra data
+    timestamp_ms: Date.now(),
+    pickupVelocity: pickupVelocity
+  };
+  
+  // Log the pickup event
+  const loggedEvent = this.dataLogger.logEvent(pickupEvent);
+  this.lastLoggedEvent = loggedEvent;
+}
+
+
+releaseBall() {
+  if (!this.isBallHeld) return;
+
+  // Store hand and ball information before the release
+  const hand = this.armParts.hand;
+  const ball = this.redBall;
+  const handVx = hand.velocity.x;
+  const handVy = hand.velocity.y;
+  
+  // Determine hand axis
+  let handAxisValue = "none";
+  if (Math.abs(handVx) > 0.1 && Math.abs(handVy) > 0.1) {
+    handAxisValue = "both";
+  } else if (Math.abs(handVx) > 0.1) {
+    handAxisValue = "x";
+  } else if (Math.abs(handVy) > 0.1) {
+    handAxisValue = "y";
+  }
+  
+  // Apply the release
+  this.isBallHeld = false;
+  this.redBall.render.opacity = 1.0;
+  this.armParts.hand.render.sprite.texture = "hand_empty.png";
+  
+  // Calculate distance between hand and ball before release
+  const distToBall = Matter.Vector.magnitude(
+    Matter.Vector.sub(hand.position, ball.position)
+  );
+  
+  // Remove the constraint and apply impulse to the ball
+  if (this.pickupConstraint) {
+    Matter.World.remove(this.physicsWorld, this.pickupConstraint);
+    this.pickupConstraint = null;
+    
+    // Apply impulse to the ball based on the hand velocity
+    const velocityMultiplier = 0.8;
+    
+    Matter.Body.setVelocity(this.redBall, {
+      x: hand.velocity.x * velocityMultiplier,
+      y: hand.velocity.y * velocityMultiplier
+    });
+    
+    // Ball properties after velocity update
+    const ballVx = ball.velocity.x;
+    const ballVy = ball.velocity.y;
+    
+    // Determine ball axis
+    let ballAxisValue = "none";
+    if (Math.abs(ballVx) > 0.1 && Math.abs(ballVy) > 0.1) {
+      ballAxisValue = "both";
+    } else if (Math.abs(ballVx) > 0.1) {
+      ballAxisValue = "x";
+    } else if (Math.abs(ballVy) > 0.1) {
+      ballAxisValue = "y";
+    }
+    
+    // Calculate release velocity
+    const releaseVelocity = Math.sqrt(ballVx * ballVx + ballVy * ballVy);
+    
+    // Create the release event with all data as direct fields (no JSON)
+    const releaseEvent = {
+      eventType: "ball_release",
+      controlMode: this.controlMode,
+      // Hand data
+      handX: hand.position.x,
+      handY: hand.position.y,
+      handVx: handVx,
+      handVy: handVy,
+      handAxis: handAxisValue,
+      // Ball data
+      ballX: ball.position.x,
+      ballY: ball.position.y,
+      ballVx: ballVx,
+      ballVy: ballVy,
+      ballAxis: ballAxisValue,
+      ballHeld: false,
+      // No collision during release
+      collision: false,
+      collisionAxis: "none",
+      collisionPartner: "none",
+      // Distance data
+      handBallDistance: Math.round(distToBall),
+      touchingBall: false,
+      // Extra data
+      timestamp_ms: Date.now(),
+      releaseVelocity: releaseVelocity
+    };
+    
+    // Log the release event
+    const loggedEvent = this.dataLogger.logEvent(releaseEvent);
+    this.lastLoggedEvent = loggedEvent;
+  }
+}
+
+
+      setMousePosition(x, y) {
+        this.mousePosition = { x, y };
+      }
+      updateMouseControl() {
+        if (this.controlMode === "mouse" && this.armParts.hand) {
+        // Implement mouse position smoothing/interpolation
+        if (!this.smoothMousePos) {
+          this.smoothMousePos = { x: this.mousePosition.x, y: this.mousePosition.y };
+        }
+        
+        // Gradually move the smoothed position toward the actual mouse position
+        // Lower alpha = smoother (but slower) response
+        const alpha = 0.08; // Try values between 0.05 and 0.2
+        
+        this.smoothMousePos.x = this.smoothMousePos.x + alpha * (this.mousePosition.x - this.smoothMousePos.x);
+        this.smoothMousePos.y = this.smoothMousePos.y + alpha * (this.mousePosition.y - this.smoothMousePos.y);
+        
+        // Use the smoothed position instead of the actual mouse position
+        this.moveTowardsTarget(this.smoothMousePos, 0.04); // Reduced speed further
+      }
+    }
+    logMacroState() {
+  // Always compute and record all state properties
+  const hand = this.armParts.hand;
+  const ball = this.redBall;
+  
+  // Hand properties with multi-axis detection
+  const handVx = hand.velocity.x;
+  const handVy = hand.velocity.y;
+  
+  // Determine if hand movement involves one or both axes
+  let handAxisValue = "none";
+  if (Math.abs(handVx) > 0.1 && Math.abs(handVy) > 0.1) {
+    handAxisValue = "both"; // Both axes have significant movement
+  } else if (Math.abs(handVx) > 0.1) {
+    handAxisValue = "x";
+  } else if (Math.abs(handVy) > 0.1) {
+    handAxisValue = "y";
+  }
+  
+  // Ball properties with multi-axis detection
+  const ballVx = ball.velocity.x;
+  const ballVy = ball.velocity.y;
+  
+  // Determine if ball movement involves one or both axes
+  let ballAxisValue = "none";
+  if (Math.abs(ballVx) > 0.1 && Math.abs(ballVy) > 0.1) {
+    ballAxisValue = "both"; // Both axes have significant movement
+  } else if (Math.abs(ballVx) > 0.1) {
+    ballAxisValue = "x";
+  } else if (Math.abs(ballVy) > 0.1) {
+    ballAxisValue = "y";
+  }
+  
+  // Calculate distance between hand and ball
+  const distToBall = Matter.Vector.magnitude(
+    Matter.Vector.sub(hand.position, ball.position)
+  );
+  const touchingBall = distToBall < 40;
+  
+  // Determine event type based on what's happening
+  let eventType = "state_update";
+  
+  const handMoving = handAxisValue !== "none";
+  const ballMoving = ballAxisValue !== "none";
+  
+  if (this.collisionOccurred && !this.isBallHeld) {
+  const isArmCollision = ["hand", "arm_link1", "arm_link2"].includes(this.collisionPartner);
+  
+  if (isArmCollision) {
+    eventType = `arm_collision_${this.collisionAxis}`;
+  } else {
+    eventType = `boundary_collision_${this.collisionAxis}`;
+  }
+  } 
+  else if (ballMoving) {
+    eventType = `ball_movement_${ballAxisValue}`;
+  }
+  else if (handMoving) {
+    eventType = `arm_movement_${handAxisValue}`;
+  }
+  
+  // Create a complete state snapshot with all properties as direct fields (no JSON)
+  const stateEvent = {
+    eventType: eventType,
+    controlMode: this.controlMode,
+    // Hand data
+    handX: hand.position.x,
+    handY: hand.position.y,
+    handVx: handVx,
+    handVy: handVy,
+    handAxis: handAxisValue,
+    // Ball data
+    ballX: ball.position.x,
+    ballY: ball.position.y,
+    ballVx: ballVx,
+    ballVy: ballVy,
+    ballAxis: ballAxisValue,
+    ballHeld: this.isBallHeld,
+    // Collision data
+    collision: this.collisionOccurred,
+    collisionAxis: this.collisionOccurred ? this.collisionAxis : "none",
+    collisionPartner: this.collisionOccurred ? this.collisionPartner : "none",
+    // Distance data
+    handBallDistance: Math.round(distToBall),
+    touchingBall: touchingBall,
+    // Timing
+    timestamp_ms: Date.now()
+  };
+  
+  // Log the complete state
+  const loggedEvent = this.dataLogger.logEvent(stateEvent);
+  this.lastLoggedEvent = loggedEvent;
+  
+  // Reset collision flag for next interval
+  this.collisionOccurred = false;
+  this.collisionAxis = "none";
+  this.collisionPartner = "none";
+}
+
+applyIntervention(intervention) {
+    // Clear any existing intervention first
+    this.clearIntervention();
+    
+    // Store intervention state
+    this.activeIntervention = intervention;
+    this.interventionStartTime = Date.now();
+    
+    // Set a flag for what type of intervention is active
+    switch(intervention.node) {
+      case 'handPosition':
+        this.fixedHandPosition = { x: intervention.x, y: intervention.y };
+        break;
+      case 'ballPosition':
+        this.fixedBallPosition = { x: intervention.x, y: intervention.y };
+        break;
+      case 'collision':
+        // Store original collision settings
+        this.originalCollisionFilter = { 
+          category: this.redBall.collisionFilter.category,
+          mask: this.redBall.collisionFilter.mask 
+        };
+        // Modify collision filter based on action
+        if (intervention.action === 'prevent') {
+          this.redBall.collisionFilter.mask = 0x0001; // Only collide with boundaries
+        }
+        break;
+    }
+    
+    // Set timer to auto-clear intervention
+    setTimeout(() => this.clearIntervention(), intervention.duration);
+    
+    // Log the intervention event
+    this.dataLogger.logEvent({
+      eventType: "causal_intervention_start",
+      node: intervention.node,
+      action: intervention.action || "fix",
+      duration: intervention.duration
+    });
+  }
+
+  clearIntervention() {
+  if (!this.interventionActive) return;
+  
+  console.log("CLEARING INTERVENTION");
+  this.interventionActive = false;
+  this.activeIntervention = null;
+  
+  // Log end of intervention
+  const endEvent = {
+    eventType: "intervention_end"
+  };
+  this.dataLogger.logEvent(endEvent);
+}
+
+  updatePhysics() {
+  if (!this.isRunning) return;
+
+  // Always update the physics engine
+  Matter.Engine.update(this.engine, 1000 / 60);
+  
+  // Apply any active intervention
+  if (this.interventionActive && this.activeIntervention) {
+    const intervention = this.activeIntervention;
+    
+    switch(intervention.node) {
+      case 'handPosition':
+        // Fix hand position
+        if (this.armParts.hand) {
+          Matter.Body.setPosition(this.armParts.hand, { 
+            x: intervention.x, 
+            y: intervention.y 
+          });
+          Matter.Body.setVelocity(this.armParts.hand, { x: 0, y: 0 });
+        }
+        break;
+        
+      case 'ballPosition':
+        // Fix ball position
+        if (this.redBall) {
+          // Release ball if needed
+          if (this.isBallHeld) {
+            this.releaseBall();
+          }
+          
+          Matter.Body.setPosition(this.redBall, { 
+            x: intervention.x, 
+            y: intervention.y 
+          });
+          Matter.Body.setVelocity(this.redBall, { x: 0, y: 0 });
+        }
+        break;
+        
+      case 'collision':
+        // Collision filters are applied once in handleIntervention
+        // Nothing to do here each frame
+        break;
+    }
+  } 
+  else {
+    // Normal behavior when no intervention is active
+    if (this.controlMode === "random") {
+      this.updateRandomMovement();
+    } else if (this.controlMode === "mouse") {
+      this.updateMouseControl();
+    }
+  }
+  
+  // Log state more frequently for better tracking
+  const now = Date.now();
+  if (!this.lastMacroLogTime || now - this.lastMacroLogTime > 100) {
+    this.logMacroState();
+    this.lastMacroLogTime = now;
+  }
+}
+
+      start() {
+        this.isRunning = true;
+        Matter.Render.run(this.render);
+        this.runSimulationLoop();
+      }
+      stop() {
+        this.isRunning = false;
+        Matter.Render.stop(this.render);
+      }
+      runSimulationLoop() {
+        const loop = () => {
+          if (this.isRunning) {
+            this.updatePhysics();
+            requestAnimationFrame(loop);
+          }
+        };
+        loop();
+      }
+      setControlMode(mode) {
+        this.controlMode = mode;
+        
+        if (mode === "random") {
+          this.targetPosition = null;
+          this.lastRandomMove = 0;
+          // Reset oscillation params for a fresh start when switching from mouse mode
+          if (!this.oscillationParams) {
+            this.oscillationParams = null;
+          }
+        } else if (mode === "mouse") {
+          // Reset mouse position smoothers when switching to mouse mode
+          this.smoothMousePos = null;
+        }
+      }
+
+      sendEventsToServer() {
+        const eventLog = this.dataLogger.events;
+        if (eventLog.length === 0) return;
+
+        // Only send the last 10 events to reduce payload size
+        const recentEvents = eventLog.slice(-10);
+        
+        console.log("Sending events to server:", recentEvents.length);
+        
+        fetch('http://localhost:5001/process_events', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ events: recentEvents })
+        })
+        .then(response => {
+          if (!response.ok) {
+            throw new Error(`Server responded with status: ${response.status}`);
+          }
+          return response.json();
+        })
+        .then(data => {
+          console.log("Intervention Response:", data);
+          if (data.interventions && data.interventions.length > 0) {
+            this.handleIntervention(data.interventions);
+          }
+        })
+        .catch(error => console.error("Error sending events:", error));
+      }
+
+      pollInterventions() {
+      // Poll every 1 seconds instead of 5 to be more responsive
+      setInterval(() => {
+        fetch('http://localhost:5001/get_interventions')
+          .then(response => response.json())
+          .then(data => {
+            if (data.interventions && data.interventions.length > 0) {
+              this.handleIntervention(data.interventions);
+            }
+          })
+          .catch(error => console.error("Error polling interventions:", error));
+      }, 1000); // Poll every 1 seconds
+    }
+
+    handleIntervention(interventions) {
+  if (!interventions || interventions.length === 0) return;
+  
+  const intervention = interventions[0];
+  console.log("Received intervention from server:", intervention);
+  
+  // Handle special restore command from server
+  if (intervention.type === "restore" || intervention.forceRestore) {
+    console.log("RESTORE COMMAND RECEIVED FROM SERVER");
+    this.clearIntervention();
+    return;
+  }
+
+  // Store intervention data
+  this.activeIntervention = intervention;
+  this.interventionStartTime = Date.now();
+  this.interventionActive = true;
+  
+  // Show visual indicator
+  this.showInterventionIndicator(intervention);
+  
+  // Log intervention event
+  const interventionEvent = {
+    eventType: "causal_intervention_start",
+    node: intervention.node,
+    action: intervention.action || "fix"
+  };
+  this.dataLogger.logEvent(interventionEvent);
+  
+  // Auto-clear intervention after duration
+  setTimeout(() => {
+    this.clearIntervention();
+  }, intervention.duration);
+}
+
+performGeneralRestore() {
+  console.log("Performing general restoration of simulation state");
+  
+  // Restore all possible states to cover our bases
+  
+  // 1. Restore hand position controls
+  if (this._originalUpdateRandomMovement) {
+    this.updateRandomMovement = this._originalUpdateRandomMovement;
+    this._originalUpdateRandomMovement = null;
+  }
+  
+  if (this._originalUpdateMouseControl) {
+    this.updateMouseControl = this._originalUpdateMouseControl;
+    this._originalUpdateMouseControl = null;
+  }
+  
+  // 2. Restore physics update 
+  if (this._originalUpdatePhysics) {
+    this.updatePhysics = this._originalUpdatePhysics;
+    this._originalUpdatePhysics = null;
+  }
+  
+  // 3. Restore collision filters
+  if (this.redBall && this._originalCollisionFilters) {
+    this.redBall.collisionFilter.category = this._originalCollisionFilters.category;
+    this.redBall.collisionFilter.mask = this._originalCollisionFilters.mask;
+    this._originalCollisionFilters = null;
+  }
+  
+  // 4. Make sure control mode is reset to a known state
+  if (this.controlMode === "intervention") {
+    this.controlMode = "random";
+    console.log("Restored control mode to random from intervention");
+  }
+  
+  // 5. Reset smoothers for natural movement
+  this.randomMovementSmoother = null;
+  this.smoothMousePos = null;
+  
+  // 6. Ensure the ball has some movement if it's nearly static
+  if (this.redBall) {
+    const currentVelocity = this.redBall.velocity;
+    const speed = Math.sqrt(currentVelocity.x * currentVelocity.x + currentVelocity.y * currentVelocity.y);
+    
+    if (speed < 0.1) {
+      console.log("Adding small impulse to ball to restart motion");
+      Matter.Body.setVelocity(this.redBall, { 
+        x: 1.0 * (Math.random() - 0.5),
+        y: 1.0 * (Math.random() - 0.5)
+      });
+    }
+  }
+  
+  // 7. Clear active intervention state
+  this.activeIntervention = null;
+  
+  // 8. Log restoration event
+  const restorationEvent = {
+    eventType: "general_restoration",
+    timestamp: Date.now()
+  };
+  
+  this.dataLogger.logEvent(restorationEvent);
+}
+
+
+      
+showInterventionIndicator(intervention) {
+  // Remove any existing indicator
+  const existingIndicator = document.getElementById('intervention-indicator');
+  if (existingIndicator) {
+    document.body.removeChild(existingIndicator);
+  }
+  
+  // Create new indicator
+  const indicator = document.createElement('div');
+  indicator.id = 'intervention-indicator';
+  indicator.style.position = 'absolute';
+  indicator.style.bottom = '50px';
+  indicator.style.left = '10px';
+  indicator.style.backgroundColor = 'rgba(255, 200, 200, 0.8)';
+  indicator.style.padding = '10px';
+  indicator.style.borderRadius = '5px';
+  indicator.style.zIndex = '100';
+  indicator.style.border = '2px solid #ff5555';
+  indicator.style.fontWeight = 'bold';
+  
+  // Simple text based on intervention type
+  indicator.textContent = `CAUSAL INTERVENTION: ${intervention.node}`;
+  
+  // Add countdown timer
+  const timer = document.createElement('div');
+  timer.textContent = `Duration: ${intervention.duration/1000}s`;
+  indicator.appendChild(timer);
+  
+  document.body.appendChild(indicator);
+  
+  // Remove when intervention ends
+  setTimeout(() => {
+    if (document.body.contains(indicator)) {
+      document.body.removeChild(indicator);
+    }
+  }, intervention.duration);
+}
+
+restoreFromIntervention(intervention) {
+  if (!intervention) return;
+  
+  console.log(`RESTORATION: Restoring from intervention type=${intervention.type}`);
+  
+  switch (intervention.type) {
+    case 'handPosition':
+      this.restoreHandPosition();
+      break;
+      
+    case 'ballPosition':
+      this.restoreBallPosition();
+      break;
+      
+    case 'collision':
+      this.restoreCollisionFilters();
+      break;
+      
+    default:
+      console.warn(`Unknown intervention type to restore: ${intervention.type}`);
+  }
+  
+  // Clear active intervention state
+  this.activeIntervention = null;
+  
+  // Make sure control mode is correctly restored
+  if (this.controlMode === "intervention") {
+    console.log("Restoring control mode to random as default");
+    this.controlMode = "random";
+  }
+  
+  // Log restoration event
+  const restorationEvent = {
+    eventType: "intervention_restoration",
+    restoredFrom: intervention.type
+  };
+  
+  this.dataLogger.logEvent(restorationEvent);
+}
+
+restoreHandPosition() {
+  console.log("Restoring hand position control");
+  
+  // This needs any specific restoration for hand positioning
+  // If we have stored original functions, restore them
+  if (this._originalUpdateRandomMovement) {
+    this.updateRandomMovement = this._originalUpdateRandomMovement;
+    this._originalUpdateRandomMovement = null;
+  }
+  
+  if (this._originalUpdateMouseControl) {
+    this.updateMouseControl = this._originalUpdateMouseControl;
+    this._originalUpdateMouseControl = null;
+  }
+  
+  // Make sure we reset the smoother to get fresh movements
+  this.randomMovementSmoother = null;
+  this.smoothMousePos = null;
+}
+
+restoreBallPosition() {
+  console.log("Restoring ball physics control");
+  
+  // If we have stored original physics function, restore it
+  if (this._originalUpdatePhysics) {
+    this.updatePhysics = this._originalUpdatePhysics;
+    this._originalUpdatePhysics = null;
+  }
+  
+  // Check if the ball needs a slight velocity impulse to "wake it up"
+  if (this.redBall) {
+    const currentVelocity = this.redBall.velocity;
+    const speed = Math.sqrt(currentVelocity.x * currentVelocity.x + currentVelocity.y * currentVelocity.y);
+    
+    if (speed < 0.1) {
+      console.log("Adding small impulse to ball to restore normal physics");
+      Matter.Body.setVelocity(this.redBall, { 
+        x: 0.5 * (Math.random() - 0.5),
+        y: 0.5 * (Math.random() - 0.5)
+      });
+    }
+  }
+}
+
+restoreCollisionFilters() {
+  console.log("Restoring collision filters");
+  
+  if (this.redBall && this._originalCollisionFilters) {
+    // Restore original collision settings
+    this.redBall.collisionFilter.category = this._originalCollisionFilters.category;
+    this.redBall.collisionFilter.mask = this._originalCollisionFilters.mask;
+    this._originalCollisionFilters = null;
+  }
+}
+
+
+ // Fix for applyHandPositionIntervention function
+ applyHandPositionIntervention(intervention) {
+  const hand = this.armParts.hand;
+  if (!hand) return;
+  
+  console.log(`Fixing hand position to x=${intervention.x}, y=${intervention.y}`);
+  
+  // Save original function references
+  this._originalUpdateRandomMovement = this.updateRandomMovement;
+  this._originalUpdateMouseControl = this.updateMouseControl;
+  
+  // Override control mode
+  this.controlMode = "intervention";
+  
+  // Replace movement update functions
+  this.updateRandomMovement = function() {
+    Matter.Body.setPosition(hand, { x: intervention.x, y: intervention.y });
+    Matter.Body.setVelocity(hand, { x: 0, y: 0 });
+  };
+  
+  this.updateMouseControl = function() {
+    Matter.Body.setPosition(hand, { x: intervention.x, y: intervention.y });
+    Matter.Body.setVelocity(hand, { x: 0, y: 0 });
+  };
+  
+  // Log this event
+  const interventionEvent = {
+    eventType: "causal_intervention",
+    node: "handPosition",
+    action: "fix",
+    targetX: intervention.x,
+    targetY: intervention.y,
+    handX: hand.position.x,
+    handY: hand.position.y,
+    collision: false
+  };
+  
+  this.dataLogger.logEvent(interventionEvent);
+  
+  // Set a timeout that will restore things, but this is a fallback
+  // The server should be sending a restore command and checkInterventionMode
+  // will also be checking for expiration
+  const self = this;
+  setTimeout(() => {
+    console.log("TIMEOUT FALLBACK: Checking if hand position intervention needs restoration");
+    if (self.activeIntervention && self.activeIntervention.type === 'handPosition') {
+      console.log("Restoring from hand position intervention via timeout");
+      self.restoreFromIntervention({
+        type: 'handPosition',
+        node: 'handPosition'
+      });
+    }
+  }, intervention.duration + 500); // Add 500ms buffer
+}
+
+// Update the applyBallPositionIntervention function to use the new system
+applyBallPositionIntervention(intervention) {
+  const ball = this.redBall;
+  if (!ball) return;
+  
+  console.log(`Fixing ball position to x=${intervention.x}, y=${intervention.y}`);
+  
+  // Save original update physics function
+  this._originalUpdatePhysics = this.updatePhysics;
+  
+  // If ball is held, release it first
+  if (this.isBallHeld) {
+    this.releaseBall();
+  }
+  
+  // Store intervention data
+  this.activeIntervention = {
+    type: intervention.node,
+    startTime: Date.now(),
+    duration: intervention.duration
+  };
+  
+  // Override physics update to fix ball position
+  const self = this;
+  this.updatePhysics = function() {
+    // Call original update for everything except ball
+    self._originalUpdatePhysics.call(self);
+    
+    // Override ball position
+    Matter.Body.setPosition(ball, { x: intervention.x, y: intervention.y });
+    Matter.Body.setVelocity(ball, { x: 0, y: 0 });
+  };
+  
+  // Log this event
+  const interventionEvent = {
+    eventType: "causal_intervention",
+    node: "ballPosition",
+    action: "fix",
+    targetX: intervention.x,
+    targetY: intervention.y,
+    ballX: ball.position.x,
+    ballY: ball.position.y
+  };
+  
+  this.dataLogger.logEvent(interventionEvent);
+  
+  // Set a timer to restore original behavior using central restoration
+  setTimeout(() => {
+    console.log("SCHEDULED RESTORATION: Ball physics after intervention");
+    self.restoreFromIntervention({
+      type: 'ballPosition',
+      node: 'ballPosition'
+    });
+    
+    // Log the end of intervention
+    const endInterventionEvent = {
+      eventType: "intervention_end",
+      node: "ballPosition",
+      ballX: ball.position.x,
+      ballY: ball.position.y
+    };
+    
+    self.dataLogger.logEvent(endInterventionEvent);
+  }, intervention.duration);
+}
+
+// Update the applyCollisionIntervention function to use the new system
+applyCollisionIntervention(intervention) {
+  const ball = this.redBall;
+  if (!ball) return;
+  
+  console.log(`Applying collision intervention: ${intervention.action}`);
+  
+  // Save original collision category
+  this._originalCollisionFilters = {
+    category: ball.collisionFilter.category,
+    mask: ball.collisionFilter.mask
+  };
+  
+  // Store intervention data
+  this.activeIntervention = {
+    type: intervention.node,
+    startTime: Date.now(),
+    duration: intervention.duration
+  };
+  
+  // Set collision filter to prevent hand-ball collisions
+  if (intervention.action === 'prevent') {
+    // Modify collision filter to prevent collisions with arm parts
+    // but still allow collisions with boundaries
+    ball.collisionFilter.mask = 0x0001; // Only collide with boundaries
+  }
+  
+  // Log this event
+  const interventionEvent = {
+    eventType: "causal_intervention",
+    node: "collision",
+    action: intervention.action,
+    ballX: ball.position.x,
+    ballY: ball.position.y
+  };
+  
+  this.dataLogger.logEvent(interventionEvent);
+  
+  // Set a timer to restore original collision behavior using central restoration
+  const self = this;
+  setTimeout(() => {
+    console.log("SCHEDULED RESTORATION: Collision behavior after intervention");
+    self.restoreFromIntervention({
+      type: 'collision',
+      node: 'collision'
+    });
+    
+    // Log the end of intervention
+    const endInterventionEvent = {
+      eventType: "intervention_end",
+      node: "collision",
+      ballX: ball.position.x,
+      ballY: ball.position.y
+    };
+    
+    self.dataLogger.logEvent(endInterventionEvent);
+  }, intervention.duration);
+}
+
+checkInterventionMode() {
+  // If no active intervention, nothing to check
+  if (!this.activeIntervention) {
+    return false;
+  }
+  
+  // Check if the intervention has expired based on time
+  const elapsed = Date.now() - this.activeIntervention.startTime;
+  
+  if (elapsed >= this.activeIntervention.duration) {
+    console.log(`Intervention expired after ${elapsed}ms (limit: ${this.activeIntervention.duration}ms)`);
+    
+    // Force immediate restoration
+    this.restoreFromIntervention(this.activeIntervention);
+    this.activeIntervention = null;
+    
+    // Make sure control mode is reset
+    if (this.controlMode === "intervention") {
+      this.controlMode = "random";
+    }
+    
+    return false;
+  }
+  
+  // Intervention is still active
+  return true;
+}
+    }
+  
+    //////////////////////////////
+    // DOM Event Listeners
+    document.addEventListener("DOMContentLoaded", () => {
+      const canvas = document.getElementById("physicsCanvas");
+      const randomButton = document.getElementById("randomModeButton");
+      const mouseButton = document.getElementById("mouseModeButton");
+      const downloadCSVButton = document.getElementById("downloadCSVButton");
+  
+      const robotArmSim = new RobotArm(canvas);
+      robotArmSim.reset();
+      robotArmSim.start();
+  
+      randomButton.addEventListener("click", () => {
+        robotArmSim.setControlMode("random");
+      });
+  
+      mouseButton.addEventListener("click", () => {
+        robotArmSim.setControlMode("mouse");
+      });
+  
+      downloadCSVButton.addEventListener("click", () => {
+        robotArmSim.dataLogger.downloadCSV();
+      });
+  
+      canvas.addEventListener("mousemove", (event) => {
+        const rect = canvas.getBoundingClientRect();
+        const mouseX = event.clientX - rect.left;
+        const mouseY = event.clientY - rect.top;
+        robotArmSim.setMousePosition(mouseX, mouseY);
+      });
+  
+      canvas.addEventListener("mousedown", (event) => {
+        const rect = canvas.getBoundingClientRect();
+        const mouseX = event.clientX - rect.left;
+        const mouseY = event.clientY - rect.top;
+        robotArmSim.handleMouseClick(mouseX, mouseY);
+      });
+    });
+  </script>
+</body>
+</html>

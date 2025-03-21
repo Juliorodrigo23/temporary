@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Robot Arm DAG Visualization</title>
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <style>
+    /* Previous styles remain the same */
+    body {
+      margin: 0;
+      padding: 20px;
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #f5f5f5;
+    }
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+      background: white;
+      padding: 20px;
+      border-radius: 8px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .title {
+      font-size: 1.5rem;
+      font-weight: bold;
+      margin-bottom: 1rem;
+    }
+    .upload-section {
+      margin-bottom: 20px;
+      padding: 20px;
+      border: 2px dashed #ccc;
+      border-radius: 8px;
+      text-align: center;
+    }
+    .upload-button {
+      display: inline-block;
+      padding: 10px 20px;
+      background-color: #3b82f6;
+      color: white;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    input[type="file"] {
+      display: none;
+    }
+    #dag {
+      width: 100%;
+      height: 600px;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      background: white;
+    }
+    .node circle {
+      stroke: #fff;
+      stroke-width: 1.5px;
+    }
+    .node text {
+      font-size: 12px;
+      font-weight: 500;
+    }
+    .link {
+      stroke: #999;
+      stroke-opacity: 0.6;
+      stroke-width: 1.5px;  /* Increased from 0.5px */
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="title">Robot Arm Causal DAG</div>
+    <div class="upload-section">
+      <label for="csvInput" class="upload-button">
+        Upload CSV File
+      </label>
+      <input type="file" id="csvInput" accept=".csv" />
+    </div>
+    <div id="dag"></div>
+  </div>
+
+  <script>
+    class ConsolidatedDAG {
+      constructor() {
+        this.width = document.getElementById('dag').clientWidth;
+        this.height = 600;
+        this.svg = d3.select('#dag')
+          .append('svg')
+          .attr('width', this.width)
+          .attr('height', this.height);
+
+        // Adjusted arrow marker
+        this.svg.append('defs').append('marker')
+          .attr('id', 'arrowhead')
+          .attr('viewBox', '0 -5 10 10')
+          .attr('refX', 30)  // Adjusted to position arrow better
+          .attr('refY', 0)
+          .attr('orient', 'auto')
+          .attr('markerWidth', 8)  // Increased size
+          .attr('markerHeight', 8)  // Increased size
+          .append('path')
+          .attr('d', 'M 0,-4 L 8,0 L 0,4')  // Adjusted arrow shape
+          .attr('fill', '#999');
+      }
+
+      // Previous CSV processing remains the same
+      processCSV(csvText) {
+        const lines = csvText.split('\n');
+        const headers = lines[0].split(',');
+        const events = lines.slice(1)
+          .filter(line => line.trim())
+          .map(line => {
+            const values = line.split(',');
+            return headers.reduce((obj, header, i) => {
+              obj[header] = values[i];
+              return obj;
+            }, {});
+          });
+
+        const nodes = [
+          { id: 'arm_x', label: 'Arm Movement X', type: 'arm', color: '#3b82f6' },
+          { id: 'arm_y', label: 'Arm Movement Y', type: 'arm', color: '#3b82f6' },
+          { id: 'ball_x', label: 'Ball Movement X', type: 'ball', color: '#ef4444' },
+          { id: 'ball_y', label: 'Ball Movement Y', type: 'ball', color: '#ef4444' },
+          { id: 'grab', label: 'Ball Grab', type: 'interaction', color: '#22c55e' },
+          { id: 'release', label: 'Ball Release', type: 'interaction', color: '#eab308' }
+        ];
+
+        const links = new Set();
+        
+        events.forEach(event => {
+          if (event.eventType?.includes('arm_movement_x')) {
+            links.add(JSON.stringify({ source: 'arm_x', target: 'ball_x' }));
+            links.add(JSON.stringify({ source: 'arm_x', target: 'grab' }));
+          }
+          if (event.eventType?.includes('arm_movement_y')) {
+            links.add(JSON.stringify({ source: 'arm_y', target: 'ball_y' }));
+            links.add(JSON.stringify({ source: 'arm_y', target: 'grab' }));
+          }
+          if (event.eventType === 'ball_pickup') {
+            links.add(JSON.stringify({ source: 'grab', target: 'release' }));
+          }
+          if (event.eventType === 'ball_release') {
+            links.add(JSON.stringify({ source: 'release', target: 'ball_x' }));
+            links.add(JSON.stringify({ source: 'release', target: 'ball_y' }));
+          }
+        });
+
+        const uniqueLinks = Array.from(links).map(link => JSON.parse(link));
+        this.drawGraph(nodes, uniqueLinks);
+      }
+
+      drawGraph(nodes, links) {
+        this.svg.selectAll('*').remove();
+
+        // Recreate arrow marker with adjusted size
+        this.svg.append('defs').append('marker')
+          .attr('id', 'arrowhead')
+          .attr('viewBox', '0 -5 10 10')
+          .attr('refX', 30)
+          .attr('refY', 0)
+          .attr('orient', 'auto')
+          .attr('markerWidth', 8)
+          .attr('markerHeight', 8)
+          .append('path')
+          .attr('d', 'M 0,-4 L 8,0 L 0,4')
+          .attr('fill', '#999');
+
+        const simulation = d3.forceSimulation(nodes)
+          .force('link', d3.forceLink(links).id(d => d.id).distance(150))
+          .force('charge', d3.forceManyBody().strength(-500))
+          .force('x', d3.forceX(this.width / 2))
+          .force('y', d3.forceY(this.height / 2));
+
+        const link = this.svg.append('g')
+          .selectAll('line')
+          .data(links)
+          .join('line')
+          .attr('class', 'link')
+          .attr('marker-end', 'url(#arrowhead)');
+
+        const node = this.svg.append('g')
+          .selectAll('.node')
+          .data(nodes)
+          .join('g')
+          .attr('class', 'node')
+          .call(d3.drag()
+            .on('start', (event, d) => {
+              if (!event.active) simulation.alphaTarget(0.3).restart();
+              d.fx = d.x;
+              d.fy = d.y;
+            })
+            .on('drag', (event, d) => {
+              d.fx = event.x;
+              d.fy = event.y;
+            })
+            .on('end', (event, d) => {
+              if (!event.active) simulation.alphaTarget(0);
+              d.fx = null;
+              d.fy = null;
+            }));
+
+        node.append('circle')
+          .attr('r', 12)
+          .attr('fill', d => d.color);
+
+        node.append('text')
+          .attr('dx', 16)
+          .attr('dy', '.35em')
+          .text(d => d.label);
+
+        simulation.on('tick', () => {
+          // Calculate the total length of the line
+          link.each(d => {
+            const dx = d.target.x - d.source.x;
+            const dy = d.target.y - d.source.y;
+            const length = Math.sqrt(dx * dx + dy * dy);
+            
+            // Adjust end points to not overlap with nodes
+            if (length) {
+              const nodeRadius = 12;
+              const scale = (length - nodeRadius * 2) / length;
+              
+              // Calculate new end points
+              d.sourceX = d.source.x + (dx * nodeRadius / length);
+              d.sourceY = d.source.y + (dy * nodeRadius / length);
+              d.targetX = d.source.x + dx * scale;
+              d.targetY = d.source.y + dy * scale;
+            }
+          });
+
+          link
+            .attr('x1', d => d.sourceX)
+            .attr('y1', d => d.sourceY)
+            .attr('x2', d => d.targetX)
+            .attr('y2', d => d.targetY);
+
+          node.attr('transform', d => `translate(${d.x},${d.y})`);
+        });
+      }
+    }
+
+    // Initialize visualization
+    const visualizer = new ConsolidatedDAG();
+
+    // Setup file input handler
+    document.getElementById('csvInput').addEventListener('change', (event) => {
+      const file = event.target.files[0];
+      if (file) {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          visualizer.processCSV(e.target.result);
+        };
+        reader.readAsText(file);
+      }
+    });
+  </script>
+</body>
+</html>
